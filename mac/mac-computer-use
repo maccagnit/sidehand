@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""mac-computer-use: stdio MCP proxy for Codex Computer Use (cua_repl). Part of sidehand.
+
+cua_repl sends an elicitation ("Allow Computer Use to use X?") before every app
+action and relies on the client to remember "always". Hermes, Pi and OpenCode
+don't, so this proxy answers those per-app approvals itself. The server's own
+app policy (blocked/forbidden apps) still applies before any elicitation.
+Other elicitations (e.g. audio recording) are forwarded to the client, or
+declined if the client can't show them. It also replaces the server's opaque
+instructions with a clear description of what the tool is for.
+
+It runs a frozen private copy of the Codex runtime (SNAP), so Codex updates
+can't break it. `mac-computer-use --snapshot` re-freezes from the installed
+Codex; the previous copy is kept in SNAP + ".prev".
+
+The snapshot's mac client is wrapped with background fallbacks (input/
+mcu_fallback.js next to this script): when the target window isn't on the
+current Space, e.g. behind a full-screen app, coordinate clicks, drags and
+scrolls go through the MCU Input helper instead of failing with
+"noWindowsAvailable".
+"""
+import glob, json, os, plistlib, shutil, subprocess, sys, threading, time
+
+PLUGIN = os.path.expanduser("~/.codex/plugins/cache/openai-bundled/unified-computer-use")
+LOG = os.path.expanduser("~/.codex/log/mac-computer-use.log")
+SNAP = os.path.expanduser("~/.local/share/mac-computer-use")
+FALLBACK = os.path.join(os.path.dirname(os.path.realpath(__file__)), "input", "mcu_fallback.js")
+CLIENT_EXPORT = "export{d as create_client};"
+CLIENT_WRAPPED = 'import{wrapClient as mcuWrap}from"./mcu_fallback.js";function mcuCreate(...a){return mcuWrap(d(...a))}export{mcuCreate as create_client};'
+INSTRUCTIONS = (
+    "Control any macOS app on this Mac the way a person would: read its UI (accessibility tree, "
+    "screenshots), click, type, scroll, drag. Use it only when no API, CLI or file-based route can do the job. "
+    "Everything goes through the `js` tool. Start with `globalThis.app = await cua.getApp(\"<app name or bundle id>\")`: "
+    "it returns the API docs and the app's current UI. App names can be localized (Calculator is \"Calcolatrice\"); "
+    "bundle ids such as com.apple.calculator always work. Then batch several actions plus `await app.getAXState()` "
+    "in one call, and verify the result from that fresh state, never from what was on screen before. "
+    "Prefer clicking UI elements over keyboard input when either works, so the user can follow the on-screen "
+    "agent cursor; type when entering text. The app doesn't need to be in front: everything also works when its "
+    "window is behind a full-screen app or on another desktop. App approvals are handled automatically."
+)
+
+
+def live_config():
+    # newest plugin version of the installed Codex
+    if not os.path.isdir(PLUGIN):
+        sys.exit("Codex's Computer Use plugin was not found. Install the Codex app, open it and turn on Computer Use first.")
+    versions = sorted(os.listdir(PLUGIN), key=lambda v: [int(x) if x.isdigit() else x for x in v.split(".")])
+    with open(os.path.join(PLUGIN, versions[-1], ".mcp.json")) as f:
+        return json.load(f)["mcpServers"]["cua_repl"]
+
+
+def snapshot():
+    # clone runtime, CLI and helper app (APFS clones, no extra disk) and point the config at the copies
+    cfg = live_config()
+    resources = os.path.dirname(os.path.dirname(os.path.dirname(cfg["command"])))  # .../Codex.app/Contents/Resources
+    helper, home = cfg["env"]["SKY_CUA_SERVICE_PATH"], cfg["env"]["CODEX_HOME"]
+    new = SNAP + ".new"
+    shutil.rmtree(new, ignore_errors=True)
+    os.makedirs(os.path.join(new, "home"))  # private CODEX_HOME: no login needed, immune to Codex config changes
+    for src in (os.path.join(resources, "cua_node"), os.path.join(resources, "codex-cli"), helper):
+        subprocess.run(["cp", "-Rc", src, os.path.join(new, os.path.basename(src))], check=True)
+    raw = json.dumps(cfg, indent=1).replace(helper, os.path.join(SNAP, os.path.basename(helper)))
+    raw = raw.replace(resources, SNAP).replace(home, os.path.join(SNAP, "home"))
+    with open(os.path.join(new, "mcp.json"), "w") as f:
+        f.write(raw)
+    shutil.rmtree(SNAP + ".prev", ignore_errors=True)
+    if os.path.exists(SNAP):
+        os.rename(SNAP, SNAP + ".prev")
+    os.rename(new, SNAP)
+    with open(os.path.join(os.path.dirname(resources), "Info.plist"), "rb") as f:
+        version = plistlib.load(f)["CFBundleShortVersionString"]
+    with open(os.path.join(SNAP, "VERSION"), "w") as f:
+        f.write(f"Codex {version}, frozen {time.strftime('%Y-%m-%d')}\n")
+    install_fallback()
+    print(f"snapshot of Codex {version} written to {SNAP}")
+
+
+def server_config():
+    frozen = os.path.join(SNAP, "mcp.json")
+    if os.path.exists(frozen):
+        with open(frozen) as f:
+            return json.load(f)
+    return live_config()  # no snapshot yet: use the installed Codex directly
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+
+
+def write_atomic(path, text):
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+
+
+def install_fallback():
+    # copy mcu_fallback.js next to each mac client in the snapshot (never the installed Codex) and wrap the client
+    with open(FALLBACK) as f:
+        fallback = f.read()
+    for client in glob.glob(os.path.join(SNAP, "cua_node/lib/node_modules/@oai/*/dist/project/cua/sky_js/src/targets/mac/create_client.js")):
+        target = os.path.join(os.path.dirname(client), "mcu_fallback.js")
+        if not os.path.exists(target) or open(target).read() != fallback:
+            write_atomic(target, fallback)
+        code = open(client).read()
+        if CLIENT_WRAPPED not in code:
+            if CLIENT_EXPORT not in code:
+                log(f"background fallback not installed, unexpected {client}")
+                continue
+            write_atomic(client, code.replace(CLIENT_EXPORT, CLIENT_WRAPPED))
+
+
+if sys.argv[1:] == ["--snapshot"]:
+    snapshot()
+    sys.exit()
+
+if os.path.exists(os.path.join(SNAP, "mcp.json")) and os.path.exists(FALLBACK):
+    install_fallback()
+cfg = server_config()
+# NODE_REPL_DISABLE_ANALYTICS: Codex's own opt-out; otherwise every action is reported to chatgpt.com via Statsig
+env = dict(os.environ, **cfg["env"], NODE_REPL_DISABLE_ANALYTICS="1")
+srv = subprocess.Popen([cfg["command"], *cfg["args"]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, text=True, bufsize=1)
+lock = threading.Lock()  # guards writes to the server's stdin
+client_elicits = False
+init_id = None  # id of the client's initialize request
+
+
+def to_server(msg):
+    with lock:
+        srv.stdin.write(json.dumps(msg) + "\n")
+        srv.stdin.flush()
+
+
+def to_client(msg):
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+
+def client_loop():
+    global client_elicits, init_id
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        msg = json.loads(line)
+        if msg.get("method") == "initialize":
+            init_id = msg.get("id")
+            caps = msg["params"].setdefault("capabilities", {})
+            client_elicits = "elicitation" in caps
+            caps["elicitation"] = {"form": {}}  # cua_repl only elicits if the client claims support
+        to_server(msg)
+    srv.stdin.close()
+
+
+def server_loop():
+    for line in srv.stdout:
+        if not line.strip():
+            continue
+        msg = json.loads(line)
+        if msg.get("method") == "elicitation/create" and "id" in msg:
+            meta = msg.get("params", {}).get("_meta", {})
+            app = meta.get("tool_params", {}).get("app")
+            if meta.get("connector_id") == "computer-use" and app and meta.get("tool_name") != "start_audio_recording":
+                log(f"auto-approved {app} ({meta.get('tool_name')})")
+                to_server({"jsonrpc": "2.0", "id": msg["id"], "result": {"action": "accept", "content": {}}})
+            elif client_elicits:
+                to_client(msg)
+            else:
+                log(f"declined (client can't elicit): {msg['params'].get('message')}")
+                to_server({"jsonrpc": "2.0", "id": msg["id"], "result": {"action": "decline"}})
+            continue
+        if init_id is not None and msg.get("id") == init_id and "result" in msg:
+            msg["result"]["instructions"] = INSTRUCTIONS
+        to_client(msg)
+
+
+threading.Thread(target=client_loop, daemon=True).start()
+server_loop()
